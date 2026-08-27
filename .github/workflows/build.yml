@@ -1,0 +1,115 @@
+name: Build Kawa Kernel
+
+on:
+  push:
+    branches: [ A12-stable ]
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Kernel variant to build'
+        required: true
+        default: 'enforcing'
+        type: choice
+        options:
+          - enforcing
+          - permissive
+          - recovery
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git fakeroot ccache build-essential ncurses-dev xz-utils \
+            libssl-dev bc flex libelf-dev bison python3 python-is-python3 \
+            zip device-tree-compiler
+
+      - name: Download proton-clang toolchain
+        run: |
+          set -e
+          for i in 1 2 3; do
+            echo "Attempt $i: cloning proton-clang"
+            rm -rf proton-clang
+            if git clone --depth=1 https://github.com/kdrag0n/proton-clang proton-clang; then
+              break
+            fi
+            echo "Clone failed, retrying in 10s..."
+            sleep 10
+          done
+          if [ ! -f proton-clang/bin/clang ]; then
+            echo "::error::Không tìm thấy proton-clang/bin/clang sau khi clone"
+            exit 1
+          fi
+          echo "Toolchain OK: $(du -sh proton-clang | cut -f1)"
+
+      - name: Select defconfig variant
+        run: |
+          mkdir -p out
+          case "${{ github.event.inputs.variant || 'enforcing' }}" in
+            enforcing)
+              cat arch/arm64/configs/kawa_defconfig > arch/arm64/configs/.tmp_defconfig
+              echo "ZIPNAME=KawaKernel-A217X_$(date +%Y%m%d)_$(git rev-parse --short HEAD).zip" >> "$GITHUB_ENV"
+              ;;
+            permissive)
+              cat arch/arm64/configs/kawa_defconfig > arch/arm64/configs/.tmp_defconfig
+              cat arch/arm64/configs/permissive_defconfig >> arch/arm64/configs/.tmp_defconfig
+              echo "ZIPNAME=KawaKernel-A217X-Permissive_$(date +%Y%m%d)_$(git rev-parse --short HEAD).zip" >> "$GITHUB_ENV"
+              ;;
+            recovery)
+              cat arch/arm64/configs/twrp_slim_defconfig > arch/arm64/configs/.tmp_defconfig
+              echo "ZIPNAME=KawaKernel-A217X-TWRP_$(date +%Y%m%d)_$(git rev-parse --short HEAD).zip" >> "$GITHUB_ENV"
+              ;;
+          esac
+          cat arch/arm64/configs/.tmp_defconfig | grep -c CONFIG || true
+
+      - name: Build kernel
+        run: |
+          export PATH="$(pwd)/proton-clang/bin:${PATH}"
+          export ARCH=arm64
+          export PLATFORM_VERSION=12
+          export ANDROID_MAJOR_VERSION=s
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export LLVM=1
+          export LLVM_IAS=1
+          export KBUILD_BUILD_USER=android-build
+          export KBUILD_BUILD_HOST=android-build
+
+          make -j$(nproc) -C "$(pwd)" O="$(pwd)/out" KCFLAGS=-w .tmp_defconfig
+          make -j$(nproc) -C "$(pwd)" O="$(pwd)/out" KCFLAGS=-w
+
+      - name: Verify build
+        run: |
+          if [ ! -f out/arch/arm64/boot/Image ]; then
+            echo "::error::Kernel Image not found!"
+            exit 1
+          fi
+          echo "Kernel Image size: $(du -h out/arch/arm64/boot/Image | cut -f1)"
+
+      - name: Build device trees
+        run: |
+          chmod +x Kawa/mkdtimg
+          Kawa/mkdtimg cfg_create out/arch/arm64/boot/dts/dtb.img Kawa/dtb.cfg -d out/arch/arm64/boot/dts/exynos
+          Kawa/mkdtimg cfg_create out/arch/arm64/boot/dts/dtbo.img Kawa/dtbo.cfg -d out/arch/arm64/boot/dts/samsung/a21s
+
+      - name: Package flashable zip (AnyKernel3)
+        run: |
+          cp -f out/arch/arm64/boot/Image Kawa/AnyKernel3/
+          cd Kawa/AnyKernel3
+          zip -r9 "${GITHUB_WORKSPACE}/${ZIPNAME}" * -x .git README.md
+          echo "Package size: $(du -h "${GITHUB_WORKSPACE}/${ZIPNAME}" | cut -f1)"
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIPNAME }}
+          path: ${{ env.ZIPNAME }}
