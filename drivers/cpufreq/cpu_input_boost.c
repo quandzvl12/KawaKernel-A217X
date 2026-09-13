@@ -34,6 +34,7 @@
 #include <linux/kthread.h>
 #include <linux/sched.h>
 #include <linux/sched/rt.h>
+#include <uapi/linux/sched/types.h>
 #include <linux/slab.h>
 #include <linux/state_notifier.h>
 
