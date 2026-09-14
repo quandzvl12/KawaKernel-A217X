@@ -37,6 +37,37 @@
 #include <uapi/linux/sched/types.h>
 #include <linux/slab.h>
 #include <linux/state_notifier.h>
+#include <linux/battery_saver.h>
+
+/*
+ * Khai báo tối thiểu cho API khoá tần số GPU (gpex_clock), thay vì include
+ * trực tiếp gpex_clock.h -- header đó kéo theo mali_kbase.h và một chuỗi
+ * include nội bộ chỉ được set qua ccflags riêng của
+ * drivers/gpu/arm/exynos/Kbuild, không có sẵn khi biên dịch từ
+ * drivers/cpufreq/. Enum và chữ ký hàm dưới đây copy khớp 1:1 với
+ * drivers/gpu/arm/exynos/include/gpex_clock.h (đã đối chiếu trực tiếp
+ * với source, không đoán). Cả 2 hàm đều non-static, build-in (=y, không
+ * phải module), nên extern link bình thường là đủ, không cần
+ * EXPORT_SYMBOL.
+ */
+typedef enum {
+	GPU_CLOCK_MAX_LOCK = 0,
+	GPU_CLOCK_MIN_LOCK,
+	GPU_CLOCK_MAX_UNLOCK,
+	GPU_CLOCK_MIN_UNLOCK,
+} gpex_clock_lock_cmd_t;
+
+typedef enum {
+	TMU_LOCK = 0,
+	SYSFS_LOCK,
+	PMQOS_LOCK,
+	CLBOOST_LOCK,
+	NUMBER_LOCK
+} gpex_clock_lock_type_t;
+
+extern int gpex_clock_lock_clock(gpex_clock_lock_cmd_t lock_command,
+				  gpex_clock_lock_type_t lock_type, int clock);
+extern int gpex_clock_get_max_clock(void);
 
 /* Available bits for boost state */
 #define SCREEN_OFF	BIT(0)
@@ -87,12 +118,39 @@ static void update_online_cpu_policy(void)
 	put_online_cpus();
 }
 
+/*
+ * GPU dùng lock_type CLBOOST_LOCK riêng (không đụng TMU_LOCK của thermal
+ * hay SYSFS_LOCK người dùng có thể tự set) -- gpex_clock_lock_clock() tự
+ * kết hợp an toàn giữa các lock_type bằng MIN/MAX nội bộ (đã đọc source
+ * xác nhận). Chỉ engage/disengage đúng 1 lần dựa trên trạng thái tổng
+ * hợp INPUT_BOOST|MAX_BOOST, giống hệt cách cpu_notifier_cb xử lý CPU,
+ * để tránh 1 trong 2 nguồn boost tắt sớm làm rớt boost của nguồn kia
+ * (cả input và wake-boost dùng chung 1 lock_type).
+ */
+static void gpu_boost_engage(void)
+{
+	int max_clk = gpex_clock_get_max_clock();
+
+	if (max_clk > 0)
+		gpex_clock_lock_clock(GPU_CLOCK_MIN_LOCK, CLBOOST_LOCK, max_clk);
+}
+
+static void gpu_boost_disengage(struct boost_drv *b)
+{
+	if (!(get_boost_state(b) & (INPUT_BOOST | MAX_BOOST)))
+		gpex_clock_lock_clock(GPU_CLOCK_MIN_UNLOCK, CLBOOST_LOCK, 0);
+}
+
 static void __cpu_input_boost_kick(struct boost_drv *b)
 {
 	if (get_boost_state(b) & SCREEN_OFF)
 		return;
 
+	if (is_battery_saver_on())
+		return;
+
 	set_boost_bit(b, INPUT_BOOST);
+	gpu_boost_engage();
 	wake_up(&b->boost_waitq);
 	mod_delayed_work(system_unbound_wq, &b->input_unboost,
 			  msecs_to_jiffies(CONFIG_INPUT_BOOST_DURATION_MS));
@@ -117,6 +175,9 @@ static void __cpu_input_boost_kick_max(struct boost_drv *b,
 	if (get_boost_state(b) & SCREEN_OFF)
 		return;
 
+	if (is_battery_saver_on())
+		return;
+
 	do {
 		curr_expires = atomic64_read(&b->max_boost_expires);
 		new_expires = jiffies + boost_jiffies;
@@ -128,6 +189,7 @@ static void __cpu_input_boost_kick_max(struct boost_drv *b,
 				   new_expires) != curr_expires);
 
 	set_boost_bit(b, MAX_BOOST);
+	gpu_boost_engage();
 	wake_up(&b->boost_waitq);
 	mod_delayed_work(system_unbound_wq, &b->max_unboost, boost_jiffies);
 }
@@ -148,6 +210,7 @@ static void input_unboost_worker(struct work_struct *work)
 					    typeof(*b), input_unboost);
 
 	clear_boost_bit(b, INPUT_BOOST);
+	gpu_boost_disengage(b);
 	wake_up(&b->boost_waitq);
 }
 
@@ -157,6 +220,7 @@ static void max_unboost_worker(struct work_struct *work)
 					    typeof(*b), max_unboost);
 
 	clear_boost_bit(b, MAX_BOOST);
+	gpu_boost_disengage(b);
 	wake_up(&b->boost_waitq);
 }
 
